@@ -1265,6 +1265,13 @@ body {
     display: block;
 }
 
+.pkg-modal-player img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: none;
+}
+
 .pkg-modal-info {
     display: flex;
     align-items: center;
