@@ -70,6 +70,7 @@
         <button class="pkg-modal-close" aria-label="Close">&times;</button>
         <div class="pkg-modal-player">
             <video controls playsinline preload="metadata"></video>
+            <img alt="preview">
         </div>
         <div class="pkg-modal-info">
             <div class="pkg-modal-info-left">
@@ -428,7 +429,7 @@
         if (pkg.video) {
             injectVideo(inner, wrap, pkg.video, card);
         } else if (pkg.image) {
-            injectImage(inner, wrap, pkg.image);
+            injectImage(inner, wrap, pkg.image, card);
         }
     }
 
@@ -479,7 +480,7 @@
         });
     }
 
-    function injectImage(inner, wrap, url) {
+    function injectImage(inner, wrap, url, card) {
         var img = document.createElement('img');
         img.className = 'pkg-media';
         img.loading = 'lazy';
@@ -492,12 +493,25 @@
         }, { once: true });
         img.src = url;
         inner.appendChild(img);
+
+        var expand = document.createElement('div');
+        expand.className = 'pkg-media-expand';
+        expand.innerHTML = '<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 8V3h5M17 8V3h-5M3 12v5h5M17 12v5h-5"/></svg>';
+        if (!hasDesktop) expand.classList.add('always');
+        inner.appendChild(expand);
+
+        card.addEventListener('click', function (e) {
+            if (e.target.closest('.pkg-card-body')) return;
+            var pkg = packages.find(function (p) { return p.name === card.dataset.name; });
+            if (pkg) openModal(pkg, card);
+        });
     }
 
     // --- Video modal ---
 
     var modalEl = document.getElementById('pkg-modal');
     var modalVideo = modalEl.querySelector('video');
+    var modalImg = modalEl.querySelector('.pkg-modal-player img');
     var modalClose = modalEl.querySelector('.pkg-modal-close');
     var modalName = modalEl.querySelector('.pkg-modal-name');
     var modalDesc = modalEl.querySelector('.pkg-modal-desc');
@@ -512,23 +526,37 @@
         modalOrigin = card.querySelector('.pkg-name a');
         clearTimeout(modalCopyTimer);
         modalCopyBtn.textContent = 'Copy';
-        modalVideo.src = pkg.video;
-        modalVideo.muted = false;
-        modalVideo.loop = false;
+        modalVideo.pause();
+
+        if (pkg.video) {
+            modalVideo.style.display = '';
+            modalImg.style.display = 'none';
+            modalVideo.src = pkg.video;
+            modalVideo.muted = false;
+            modalVideo.loop = false;
+            modalEl.setAttribute('aria-label', 'Video demo for ' + pkg.name);
+            modalVideo.play().catch(function () {});
+        } else if (pkg.image) {
+            modalVideo.style.display = 'none';
+            modalImg.style.display = 'block';
+            modalImg.src = pkg.image;
+            modalEl.setAttribute('aria-label', 'Image preview for ' + pkg.name);
+        }
+
         modalName.textContent = pkg.name;
         modalName.href = npmUrl(pkg);
         modalDesc.textContent = pkg.description || '';
         modalCode.textContent = 'pi install npm:' + pkg.name;
-        modalEl.setAttribute('aria-label', 'Video demo for ' + pkg.name);
         modalEl.classList.add('open');
         document.documentElement.style.overflow = 'hidden';
         modalClose.focus();
-        modalVideo.play().catch(function () {});
     }
 
     function closeModal() {
         modalEl.classList.remove('open');
         modalVideo.pause();
+        modalImg.style.display = 'none';
+        modalImg.src = '';
         document.documentElement.style.overflow = '';
         if (modalOrigin) {
             modalOrigin.focus();
