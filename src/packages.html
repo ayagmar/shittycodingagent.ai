@@ -54,6 +54,7 @@
 </div>
 
 <div class="pkg-grid" id="pkg-grid"></div>
+<div class="pkg-infinite-sentinel" id="pkg-infinite-sentinel"></div>
 <div class="pkg-error" id="pkg-error" style="display:none">
     <p>Couldn't reach the npm registry.</p>
     <button id="pkg-retry">Retry</button>
@@ -100,16 +101,32 @@
 
 <script>
 (function () {
+    'use strict';
+
+    // --- Configuration ---
     var SEARCH_API = 'https://registry.npmjs.org/-/v1/search';
     var MANIFEST_API = 'https://registry.npmjs.org/';
     var CACHE_KEY = 'pi-pkg-cache';
+    var CACHE_VERSION = 2;
     var CACHE_TTL = 15 * 60 * 1000;
-    var BATCH_SIZE = 15;
-    var FLAG_API = 'https://api.github.com/repos/badlogic/pi-mono/issues?labels=package-flag&state=all&per_page=100';
+    var PACKAGE_MOBILE_BREAKPOINT = 640;
+    var DESKTOP_BATCH_SIZE = 24;
+    var MOBILE_BATCH_SIZE = 12;
+    var MANIFEST_RETRY_DELAY = 10000;
+    var MANIFEST_FILTER_REFRESH_DELAY = 50;
+    var FLAG_PAGE_SIZE = 100;
+    var FLAG_API = 'https://api.github.com/repos/badlogic/pi-mono/issues';
     var FLAG_CACHE_KEY = 'pi-pkg-flags';
     var FLAG_CACHE_TTL = 10 * 60 * 1000;
+    var RECENT_SCROLL_DEBOUNCE = 50;
+    var RECENT_CLICK_SUPPRESS_DELAY = 300;
+    var RECENT_MOMENTUM_STALE_MS = 100;
+    var CARD_HIGHLIGHT_DURATION = 1500;
+    var COPY_FEEDBACK_MS = 1500;
 
+    // --- DOM Elements ---
     var grid = document.getElementById('pkg-grid');
+    var infiniteSentinel = document.getElementById('pkg-infinite-sentinel');
     var errorEl = document.getElementById('pkg-error');
     var retryBtn = document.getElementById('pkg-retry');
     var searchInput = document.querySelector('.pkg-search');
@@ -130,17 +147,60 @@
     var readmeName = readmeEl.querySelector('.pkg-readme-pkg-name');
     var readmeVersion = readmeEl.querySelector('.pkg-readme-version');
 
+    // --- State: Data ---
+    var searchPackages = [];
     var packages = [];
+    var filteredPackages = [];
+    var packageIndex = {};
+    var flaggedPkgs = {};
+
+    // --- State: UI & Rendering ---
     var cardMap = {};
     var activeTypes = new Set();
+    var renderedCount = 0;
+    var hoverMedia = window.matchMedia('(hover: hover)');
+    var hasDesktop = hoverMedia.matches;
+    var isRendering = false;
+    var renderGeneration = 0;
+
+    // --- State: Observers ---
+    var mediaObserver = null;
+    var authorsObserver = null;
+    var avatarObserver = null;
+    var infiniteObserver = null;
+
+    // --- State: Manifest Discovery ---
+    var manifestCache = {};
+    var manifestFailed = {};
+    var manifestQueue = [];
+    var manifestPending = {};
+    var manifestRetryAfter = {};
+    var manifestRetryCount = {};
+    var manifestController = null;
+    var manifestActiveCount = 0;
+    var MAX_MANIFEST_CONCURRENCY = 8;
+    var MAX_MANIFEST_RETRIES = 5;
+
+    // --- State: Caching & Timers ---
     var fetchCounter = 0;
-    var hasDesktop = window.matchMedia('(hover: hover)').matches;
-    var flaggedPkgs = {};
+    var searchCacheTimestamp = 0;
+    var debounceTimer = null;
+    var manifestRetryTimer = null;
+    var filteredRefreshTimer = null;
+    var sortedPackagesCache = {};
+
+    // --- State: Modal & Authors ---
     var readmeCache = {};
+    var readmeCacheKeys = [];
+    var README_CACHE_MAX = 20;
     var libsReady = null;
     var readmeLoadingFor = '';
     var readmeOrigin = null;
+    var readmeOriginPkgName = '';
+    var authorsData = [];
+    var authorsRendered = false;
 
+    // --- Constants ---
     var SVG_NPM = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M0 0v24h24v-24h-24zm19.2 19.2h-2.4v-9.6h-4.8v9.6h-7.2v-14.4h14.4v14.4z"/></svg>';
     var SVG_GH = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>';
     var SVG_README = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/></svg>';
@@ -148,6 +208,45 @@
     var SVG_SHIELD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>';
     var AUTHOR_COLORS = ['#4ade80', '#60a5fa', '#c084fc', '#fbbf24', '#22d3ee', '#fb7185', '#f97316', '#71717a'];
 
+    // --- Intersection Observers ---
+    if ('IntersectionObserver' in window) {
+        mediaObserver = new IntersectionObserver(function (entries) {
+            entries.forEach(function (entry) {
+                var card = entry.target;
+                if (entry.isIntersecting) {
+                    card.dataset.mediaVisible = 'true';
+                    revealCardMedia(card);
+                } else {
+                    card.dataset.mediaVisible = 'false';
+                    cleanupCardMedia(card);
+                }
+            });
+        }, { rootMargin: '400px 0px' });
+
+        authorsObserver = new IntersectionObserver(function (entries) {
+            if (entries[0].isIntersecting) {
+                authorsObserver.unobserve(authorsSection);
+                renderAuthors();
+            }
+        }, { rootMargin: '200px 0px' });
+
+        avatarObserver = new IntersectionObserver(function (entries) {
+            entries.forEach(function (entry) {
+                if (entry.isIntersecting) {
+                    avatarObserver.unobserve(entry.target);
+                    loadAvatar(entry.target);
+                }
+            });
+        }, { rootMargin: '100px 0px' });
+
+        infiniteObserver = new IntersectionObserver(function (entries) {
+            if (entries[0].isIntersecting && !isRendering) {
+                handleInfiniteScroll();
+            }
+        }, { rootMargin: '200px 0px' });
+    }
+
+    // --- MD5 (for Gravatar) ---
     function md5(str) {
         function rl(n, c) { return (n << c) | (n >>> (32 - c)); }
         function cm(q, a, b, x, s, t) { return (rl((a + q + x + t) | 0, s) + b) | 0; }
@@ -190,8 +289,7 @@
         return hex(A) + hex(B) + hex(C) + hex(D);
     }
 
-    // --- Type detection ---
-
+    // --- Type Detection ---
     function typesFromKeywords(keywords) {
         var types = [];
         if (!keywords) return types;
@@ -226,13 +324,12 @@
         if (!pi || !pi.image) return null;
         try {
             var pathname = new URL(pi.image).pathname.toLowerCase();
-            if (pathname.endsWith('.webp') || pathname.endsWith('.png') || pathname.endsWith('.jpg') || pathname.endsWith('.jpeg') || pathname.endsWith('.gif')) return pi.image;
+            if (/\.(webp|png|jpg|jpeg|gif)$/.test(pathname)) return pi.image;
         } catch (e) {}
         return null;
     }
 
     // --- Helpers ---
-
     function normalizeRepo(url) {
         if (!url) return null;
         return url.replace(/^git\+/, '').replace(/\.git$/, '');
@@ -243,10 +340,27 @@
     }
 
     function authorName(pkg) {
-        if (pkg.maintainers && pkg.maintainers.length && pkg.maintainers[0].username) return pkg.maintainers[0].username;
+        if (pkg.maintainers) {
+            var maintainer = pkg.maintainers.find(function (entry) {
+                return entry.username;
+            });
+            if (maintainer) return maintainer.username;
+        }
         if (pkg.publisher && pkg.publisher.username) return pkg.publisher.username;
         if (pkg.publisher && pkg.publisher.email) return pkg.publisher.email;
         return 'unknown';
+    }
+
+    function authorEmail(pkg, resolvedName) {
+        if (pkg.maintainers) {
+            var maintainer = pkg.maintainers.find(function (entry) {
+                return entry.username === resolvedName;
+            });
+            if (maintainer && maintainer.email) return maintainer.email;
+        }
+        if (pkg.publisher && pkg.publisher.username === resolvedName && pkg.publisher.email) return pkg.publisher.email;
+        if (pkg.publisher && pkg.publisher.email === resolvedName) return pkg.publisher.email;
+        return '';
     }
 
     function relativeDate(iso) {
@@ -265,6 +379,10 @@
         return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
     }
 
+    function currentBatchSize() {
+        return window.innerWidth <= PACKAGE_MOBILE_BREAKPOINT ? MOBILE_BATCH_SIZE : DESKTOP_BATCH_SIZE;
+    }
+
     function hashColor(str) {
         var hash = 0;
         for (var i = 0; i < str.length; i++) {
@@ -280,9 +398,161 @@
         return flag.hide ? 'hide' : 'warn';
     }
 
-    // --- Card creation ---
+    function cloneSearchPackage(pkg) {
+        return {
+            name: pkg.name,
+            description: pkg.description || '',
+            keywords: (pkg.keywords || []).slice(),
+            date: pkg.date,
+            links: pkg.links || {},
+            publisher: pkg.publisher || {},
+            maintainers: (pkg.maintainers || []).slice(),
+            version: pkg.version,
+            downloads: pkg.downloads || 0,
+            types: (pkg.types || []).slice(),
+            video: null,
+            image: null
+        };
+    }
 
-    function createCard(pkg, flagStatus) {
+    function indexPackages() {
+        packageIndex = {};
+        packages.forEach(function (pkg) { packageIndex[pkg.name] = pkg; });
+        sortedPackagesCache = {};
+    }
+
+    function appendFlagBadge(container, name) {
+        if (getFlagStatus(name) !== 'warn') return;
+        var flagBadge = document.createElement('span');
+        flagBadge.className = 'pkg-badge';
+        flagBadge.dataset.type = 'flagged';
+        flagBadge.innerHTML = SVG_SHIELD + ' flagged';
+        flagBadge.title = 'This package has been flagged for review. We recommend waiting before installing.';
+        container.appendChild(flagBadge);
+    }
+
+    function clearManifestRetryTimer() {
+        if (manifestRetryTimer) {
+            clearTimeout(manifestRetryTimer);
+            manifestRetryTimer = null;
+        }
+    }
+
+    function scheduleManifestRetryTimer() {
+        clearManifestRetryTimer();
+
+        var nextRetryAt = null;
+        var now = Date.now();
+        Object.keys(manifestRetryAfter).forEach(function (name) {
+            var retryAt = manifestRetryAfter[name];
+            if (!retryAt) return;
+            if (nextRetryAt === null || retryAt < nextRetryAt) nextRetryAt = retryAt;
+        });
+
+        if (nextRetryAt === null) return;
+
+        manifestRetryTimer = setTimeout(function () {
+            var now = Date.now();
+            Object.keys(manifestRetryAfter).forEach(function (name) {
+                if (manifestRetryAfter[name] > now) return;
+                var pkg = packageIndex[name];
+                delete manifestRetryAfter[name];
+                if (pkg) queueManifestFetch(pkg);
+            });
+            scheduleManifestRetryTimer();
+        }, Math.max(0, nextRetryAt - now));
+    }
+
+    function abortManifestFetches() {
+        if (manifestController) {
+            manifestController.abort();
+            manifestController = null;
+        }
+        manifestActiveCount = 0;
+        manifestQueue = [];
+        manifestFailed = {};
+        Object.keys(manifestPending).forEach(function (key) { delete manifestPending[key]; });
+        Object.keys(manifestRetryAfter).forEach(function (key) { delete manifestRetryAfter[key]; });
+        Object.keys(manifestRetryCount).forEach(function (key) { delete manifestRetryCount[key]; });
+        clearManifestRetryTimer();
+    }
+
+    function bindActionCard(card, handler) {
+        card.tabIndex = 0;
+        card.setAttribute('role', 'button');
+        card.addEventListener('click', handler);
+        card.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                handler();
+            }
+        });
+    }
+
+    function clearRenderedCards() {
+        if (mediaObserver) mediaObserver.disconnect();
+        renderGeneration++;
+        pendingRenderRange = null;
+        renderCyclePromise = null;
+        isRendering = false;
+        renderedCount = 0;
+        cardMap = {};
+        grid.innerHTML = '';
+    }
+
+    function clearActiveFilterPills() {
+        activeTypes.forEach(function (t) {
+            var pill = document.querySelector('.pkg-pill[data-type="' + t + '"]');
+            if (pill) pill.classList.remove('active');
+        });
+        activeTypes.clear();
+    }
+
+    function ensureMediaWrapState(card, pkg) {
+        var wrap = card.querySelector('.pkg-media-wrap');
+        if (wrap) wrap.classList.toggle('has-media', !!(pkg && (pkg.video || pkg.image)));
+    }
+
+    function focusCard(name) {
+        var card = cardMap[name];
+        if (!card) return false;
+        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        card.classList.add('pkg-highlight');
+        setTimeout(function () { card.classList.remove('pkg-highlight'); }, CARD_HIGHLIGHT_DURATION);
+        return true;
+    }
+
+    function bumpMediaGeneration(card) {
+        var generation = (parseInt(card.dataset.mediaGeneration || '0', 10) || 0) + 1;
+        card.dataset.mediaGeneration = String(generation);
+        return String(generation);
+    }
+
+    function isCurrentMediaGeneration(card, generation) {
+        return card.dataset.mediaGeneration === String(generation);
+    }
+
+    function cleanupCardMedia(card) {
+        bumpMediaGeneration(card);
+        if (card.dataset.mediaInjected !== 'true') return;
+        var inner = card.querySelector('.pkg-media-inner');
+        if (inner) {
+            var v = inner.querySelector('video');
+            if (v) {
+                v.pause();
+                v.removeAttribute('src');
+                v.load();
+            }
+            inner.innerHTML = '';
+        }
+        var wrap = card.querySelector('.pkg-media-wrap');
+        if (wrap) wrap.classList.remove('loaded');
+        card.dataset.mediaInjected = 'false';
+    }
+
+    // --- Card Creation ---
+    function createCard(pkg) {
+        var flagStatus = getFlagStatus(pkg.name);
         var card = document.createElement('div');
         card.className = 'pkg-card';
         card.dataset.name = pkg.name;
@@ -293,6 +563,7 @@
         mediaInner.className = 'pkg-media-inner';
         mediaWrap.appendChild(mediaInner);
         card.appendChild(mediaWrap);
+        ensureMediaWrapState(card, pkg);
 
         var body = document.createElement('div');
         body.className = 'pkg-card-body';
@@ -325,14 +596,7 @@
         var badges = document.createElement('div');
         badges.className = 'pkg-badges';
         renderBadges(badges, pkg.types);
-        if (flagStatus === 'warn') {
-            var flagBadge = document.createElement('span');
-            flagBadge.className = 'pkg-badge';
-            flagBadge.dataset.type = 'flagged';
-            flagBadge.innerHTML = SVG_SHIELD + ' flagged';
-            flagBadge.title = 'This package has been flagged for review. We recommend waiting before installing.';
-            badges.appendChild(flagBadge);
-        }
+        appendFlagBadge(badges, pkg.name);
         body.appendChild(badges);
 
         if (flagStatus === 'warn') {
@@ -392,7 +656,7 @@
             navigator.clipboard.writeText('pi install npm:' + pkg.name);
             copyBtn.textContent = 'Copied!';
             clearTimeout(copyTimer);
-            copyTimer = setTimeout(function () { copyBtn.textContent = 'Copy'; }, 1500);
+            copyTimer = setTimeout(function () { copyBtn.textContent = 'Copy'; }, COPY_FEEDBACK_MS);
         });
         install.appendChild(copyBtn);
         body.appendChild(install);
@@ -419,21 +683,81 @@
         });
     }
 
-    // --- Media injection (Phase 2) ---
+    // --- Media Injection ---
+    function revealCardMedia(card) {
+        var pkg = packageIndex[card.dataset.name];
+        if (!pkg) return;
+        
+        if (card.dataset.mediaVisible === 'true') {
+            queueManifestFetch(pkg);
+        }
+
+        if (card.dataset.mediaVisible !== 'true' || card.dataset.mediaInjected === 'true') return;
+        if (!pkg.video && !pkg.image) return;
+        injectMedia(card, pkg);
+    }
+
+    function observeCardMedia(card) {
+        if (!mediaObserver) {
+            card.dataset.mediaVisible = 'true';
+            revealCardMedia(card);
+            return;
+        }
+        mediaObserver.observe(card);
+    }
 
     function injectMedia(card, pkg) {
         var inner = card.querySelector('.pkg-media-inner');
         var wrap = card.querySelector('.pkg-media-wrap');
+        ensureMediaWrapState(card, pkg);
         if (!inner || wrap.classList.contains('loaded')) return;
+        var generation = bumpMediaGeneration(card);
 
         if (pkg.video) {
-            injectVideo(inner, wrap, pkg.video, card);
+            if (hasDesktop) injectVideo(inner, wrap, pkg.video, card, generation);
+            else injectVideoPlaceholder(inner, wrap, card);
         } else if (pkg.image) {
-            injectImage(inner, wrap, pkg.image, card);
+            injectImage(inner, wrap, pkg.image, card, generation);
         }
+
+        card.dataset.mediaInjected = 'true';
     }
 
-    function injectVideo(inner, wrap, url, card) {
+    function appendMediaExpand(inner) {
+        var expand = document.createElement('div');
+        expand.className = 'pkg-media-expand';
+        expand.innerHTML = '<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 8V3h5M17 8V3h-5M3 12v5h5M17 12v5h-5"/></svg>';
+        if (!hasDesktop) expand.classList.add('always');
+        inner.appendChild(expand);
+    }
+
+    function bindMediaOpen(card) {
+        if (card.dataset.mediaOpenBound === 'true') return;
+        card.dataset.mediaOpenBound = 'true';
+        card.addEventListener('click', function (e) {
+            if (e.target.closest('.pkg-card-body')) return;
+            var pkg = packageIndex[card.dataset.name];
+            if (pkg && (pkg.video || pkg.image)) openModal(pkg, card);
+        });
+    }
+
+    function bindVideoHover(card) {
+        if (card.dataset.mediaHoverBound === 'true') return;
+        card.dataset.mediaHoverBound = 'true';
+        card.addEventListener('mouseenter', function () {
+            var video = card.querySelector('.pkg-media-inner video');
+            if (video) video.play().catch(function () {});
+        });
+        card.addEventListener('mouseleave', function () {
+            var video = card.querySelector('.pkg-media-inner video');
+            if (video) {
+                video.pause();
+                video.currentTime = 0;
+            }
+        });
+    }
+
+    function injectVideo(inner, wrap, url, card, generation) {
         var video = document.createElement('video');
         video.className = 'pkg-media';
         video.muted = true;
@@ -442,73 +766,54 @@
         video.preload = 'metadata';
 
         video.addEventListener('error', function () {
+            if (!isCurrentMediaGeneration(card, generation)) return;
             inner.innerHTML = '<div class="pkg-media-fallback">media unavailable</div>';
-            video = null;
         }, { once: true });
 
         video.addEventListener('loadedmetadata', function () {
+            if (!isCurrentMediaGeneration(card, generation)) return;
             video.currentTime = 0.1;
         }, { once: true });
 
         video.src = url;
         inner.appendChild(video);
         wrap.classList.add('loaded');
-
-        var expand = document.createElement('div');
-        expand.className = 'pkg-media-expand';
-        expand.innerHTML = '<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 8V3h5M17 8V3h-5M3 12v5h5M17 12v5h-5"/></svg>';
-        if (!hasDesktop) expand.classList.add('always');
-        inner.appendChild(expand);
-
-        if (hasDesktop) {
-            card.addEventListener('mouseenter', function () {
-                if (!video) return;
-                video.play().catch(function () {});
-            });
-            card.addEventListener('mouseleave', function () {
-                if (!video) return;
-                video.pause();
-                video.currentTime = 0;
-            });
-        }
-
-        card.addEventListener('click', function (e) {
-            if (!video) return;
-            if (e.target.closest('.pkg-card-body')) return;
-            var pkg = packages.find(function (p) { return p.name === card.dataset.name; });
-            if (pkg) openModal(pkg, card);
-        });
+        appendMediaExpand(inner);
+        bindMediaOpen(card);
+        if (hasDesktop) bindVideoHover(card);
     }
 
-    function injectImage(inner, wrap, url, card) {
+    function injectVideoPlaceholder(inner, wrap, card) {
+        var fallback = document.createElement('div');
+        fallback.className = 'pkg-media-fallback';
+        fallback.textContent = 'tap to preview';
+        inner.appendChild(fallback);
+        wrap.classList.add('loaded');
+        appendMediaExpand(inner);
+        bindMediaOpen(card);
+    }
+
+    function injectImage(inner, wrap, url, card, generation) {
         var img = document.createElement('img');
         img.className = 'pkg-media';
         img.loading = 'lazy';
+        img.decoding = 'async';
         img.alt = 'preview';
         img.addEventListener('error', function () {
+            if (!isCurrentMediaGeneration(card, generation)) return;
             inner.innerHTML = '<div class="pkg-media-fallback">media unavailable</div>';
         }, { once: true });
         img.addEventListener('load', function () {
+            if (!isCurrentMediaGeneration(card, generation)) return;
             wrap.classList.add('loaded');
         }, { once: true });
         img.src = url;
         inner.appendChild(img);
-
-        var expand = document.createElement('div');
-        expand.className = 'pkg-media-expand';
-        expand.innerHTML = '<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 8V3h5M17 8V3h-5M3 12v5h5M17 12v5h-5"/></svg>';
-        if (!hasDesktop) expand.classList.add('always');
-        inner.appendChild(expand);
-
-        card.addEventListener('click', function (e) {
-            if (e.target.closest('.pkg-card-body')) return;
-            var pkg = packages.find(function (p) { return p.name === card.dataset.name; });
-            if (pkg) openModal(pkg, card);
-        });
+        appendMediaExpand(inner);
+        bindMediaOpen(card);
     }
 
-    // --- Video modal ---
-
+    // --- Video Modal ---
     var modalEl = document.getElementById('pkg-modal');
     var modalVideo = modalEl.querySelector('video');
     var modalImg = modalEl.querySelector('.pkg-modal-player img');
@@ -518,15 +823,33 @@
     var modalCode = modalEl.querySelector('.pkg-modal-install code');
     var modalCopyBtn = modalEl.querySelector('.pkg-modal-install .copy-btn');
     var modalOrigin = null;
-    var modalPkgName = '';
+    var modalOriginPkgName = '';
     var modalCopyTimer;
 
+    function restoreFocus(originEl, pkgName) {
+        if (originEl && originEl.isConnected) {
+            originEl.focus();
+            return;
+        }
+        if (pkgName && cardMap[pkgName]) {
+            var currentLink = cardMap[pkgName].querySelector('.pkg-name a');
+            if (currentLink) {
+                currentLink.focus();
+                return;
+            }
+        }
+        searchInput.focus();
+    }
+
     function openModal(pkg, card) {
-        modalPkgName = pkg.name;
+        modalOriginPkgName = pkg.name;
         modalOrigin = card.querySelector('.pkg-name a');
         clearTimeout(modalCopyTimer);
         modalCopyBtn.textContent = 'Copy';
         modalVideo.pause();
+        modalVideo.removeAttribute('src');
+        modalVideo.load();
+        modalImg.src = '';
 
         if (pkg.video) {
             modalVideo.style.display = '';
@@ -555,13 +878,14 @@
     function closeModal() {
         modalEl.classList.remove('open');
         modalVideo.pause();
+        modalVideo.removeAttribute('src');
+        modalVideo.load();
         modalImg.style.display = 'none';
         modalImg.src = '';
         document.documentElement.style.overflow = '';
-        if (modalOrigin) {
-            modalOrigin.focus();
-            modalOrigin = null;
-        }
+        restoreFocus(modalOrigin, modalOriginPkgName);
+        modalOrigin = null;
+        modalOriginPkgName = '';
     }
 
     modalEl.addEventListener('click', function (e) {
@@ -569,14 +893,13 @@
     });
     modalClose.addEventListener('click', closeModal);
     modalCopyBtn.addEventListener('click', function () {
-        navigator.clipboard.writeText('pi install npm:' + modalPkgName);
+        navigator.clipboard.writeText('pi install npm:' + modalOriginPkgName);
         modalCopyBtn.textContent = 'Copied!';
         clearTimeout(modalCopyTimer);
-        modalCopyTimer = setTimeout(function () { modalCopyBtn.textContent = 'Copy'; }, 1500);
+        modalCopyTimer = setTimeout(function () { modalCopyBtn.textContent = 'Copy'; }, COPY_FEEDBACK_MS);
     });
 
-    // --- README modal ---
-
+    // --- README Modal ---
     function loadLibs() {
         if (libsReady) return libsReady;
         libsReady = new Promise(function (resolve, reject) {
@@ -606,15 +929,28 @@
         return libsReady;
     }
 
+    function setReadmeCache(key, value) {
+        if (readmeCache.hasOwnProperty(key)) {
+            var idx = readmeCacheKeys.indexOf(key);
+            if (idx !== -1) readmeCacheKeys.splice(idx, 1);
+        }
+        readmeCacheKeys.push(key);
+        readmeCache[key] = value;
+        while (readmeCacheKeys.length > README_CACHE_MAX) {
+            delete readmeCache[readmeCacheKeys.shift()];
+        }
+    }
+
     function fetchReadme(name, version) {
-        if (readmeCache.hasOwnProperty(name)) return Promise.resolve(readmeCache[name]);
+        var cacheKey = name + '#' + version;
+        if (readmeCache.hasOwnProperty(cacheKey)) return Promise.resolve(readmeCache[cacheKey]);
         var url = 'https://cdn.jsdelivr.net/npm/' + encodeURIComponent(name) + '@' + version + '/README.md';
         return fetch(url).then(function (r) {
             if (r.ok) return r.text();
-            if (r.status === 404) { readmeCache[name] = null; return null; }
+            if (r.status === 404) { setReadmeCache(cacheKey, null); return null; }
             return null;
         }).then(function (text) {
-            if (text !== null) readmeCache[name] = text;
+            if (text !== null) setReadmeCache(cacheKey, text);
             return text;
         }).catch(function () { return null; });
     }
@@ -634,8 +970,10 @@
     }
 
     function openReadmeModal(pkg) {
-        readmeLoadingFor = pkg.name;
+        var cacheKey = pkg.name + '#' + pkg.version;
+        readmeLoadingFor = cacheKey;
         readmeOrigin = document.activeElement;
+        readmeOriginPkgName = pkg.name;
         readmeName.textContent = pkg.name;
         readmeName.href = npmUrl(pkg);
         readmeVersion.textContent = 'v' + pkg.version;
@@ -647,7 +985,7 @@
         readmeClose.focus();
 
         Promise.all([loadLibs(), fetchReadme(pkg.name, pkg.version)]).then(function (results) {
-            if (readmeLoadingFor !== pkg.name) return;
+            if (readmeLoadingFor !== cacheKey) return;
             var text = results[1];
             if (text === null) {
                 showReadmeError('README not available.', pkg);
@@ -665,7 +1003,7 @@
                 if (href && !/^https?:\/\/|^\/\/|^#|^mailto:/.test(href)) a.href = base + href.replace(/^\.\//, '');
             });
         }).catch(function () {
-            if (readmeLoadingFor !== pkg.name) return;
+            if (readmeLoadingFor !== cacheKey) return;
             showReadmeError('Failed to load README.', pkg);
         });
     }
@@ -674,10 +1012,9 @@
         readmeLoadingFor = '';
         readmeEl.classList.remove('open');
         document.documentElement.style.overflow = '';
-        if (readmeOrigin) {
-            readmeOrigin.focus();
-            readmeOrigin = null;
-        }
+        restoreFocus(readmeOrigin, readmeOriginPkgName);
+        readmeOrigin = null;
+        readmeOriginPkgName = '';
     }
 
     readmeEl.addEventListener('click', function (e) {
@@ -685,8 +1022,7 @@
     });
     readmeClose.addEventListener('click', closeReadmeModal);
 
-    // --- Keyboard (consolidated) ---
-
+    // --- Keyboard ---
     document.addEventListener('keydown', function (e) {
         if (e.key === 'Escape') {
             if (modalEl.classList.contains('open')) closeModal();
@@ -695,22 +1031,24 @@
     });
 
     // --- Recent Releases ---
-
     function updateRecentArrows() {
         var sl = recentScroll.scrollLeft;
         var max = recentScroll.scrollWidth - recentScroll.clientWidth;
         recentPrev.classList.toggle('visible', sl > 1);
         recentNext.classList.toggle('visible', sl < max - 1);
-        recentTrack.classList.toggle('fade-left', sl > 1);
-        recentTrack.classList.toggle('fade-right', sl < max - 1);
+        if (recentTrack) {
+            recentTrack.classList.toggle('fade-left', sl > 1);
+            recentTrack.classList.toggle('fade-right', sl < max - 1);
+        }
     }
 
     var recentScrollTimer;
     recentScroll.addEventListener('scroll', function () {
         clearTimeout(recentScrollTimer);
-        recentScrollTimer = setTimeout(updateRecentArrows, 50);
+        recentScrollTimer = setTimeout(updateRecentArrows, RECENT_SCROLL_DEBOUNCE);
     });
 
+    // Drag-to-scroll with momentum for Recent section
     var dragState = null;
     var momentumId = null;
     var momentumVel = 0;
@@ -783,8 +1121,8 @@
             recentScroll.addEventListener('click', suppress, true);
             suppressTimer = setTimeout(function () {
                 recentScroll.removeEventListener('click', suppress, true);
-            }, 300);
-            var stale = Date.now() - dragState.lastTime > 100;
+            }, RECENT_CLICK_SUPPRESS_DELAY);
+            var stale = Date.now() - dragState.lastTime > RECENT_MOMENTUM_STALE_MS;
             momentumVel = stale ? 0 : dragState.velocity * 16;
             if (Math.abs(momentumVel) > 0.5) {
                 momentumId = requestAnimationFrame(tickMomentum);
@@ -806,8 +1144,10 @@
         if (!recent.length) { recentSection.style.display = 'none'; return; }
 
         recent.forEach(function (pkg) {
+            queueManifestFetch(pkg);
             var card = document.createElement('div');
             card.className = 'pkg-recent-card';
+            card.dataset.name = pkg.name;
 
             var name = document.createElement('div');
             name.className = 'pkg-recent-name';
@@ -834,7 +1174,7 @@
             }
             card.appendChild(footer);
 
-            card.addEventListener('click', function () { scrollToCard(pkg.name); });
+            bindActionCard(card, function () { scrollToCard(pkg.name); });
             recentScroll.appendChild(card);
         });
         recentSection.style.display = '';
@@ -842,79 +1182,206 @@
         updateRecentArrows();
     }
 
+    function ensureCardRendered(name) {
+        var targetIndex = filteredPackages.findIndex(function (pkg) { return pkg.name === name; });
+        if (targetIndex === -1) return Promise.resolve(false);
+
+        if (renderedCount > targetIndex && cardMap[name]) {
+            return Promise.resolve(true);
+        }
+
+        return renderRange(renderedCount, targetIndex + 1).then(function () {
+            return !!cardMap[name];
+        });
+    }
+
+    var pendingRenderRange = null;
+    var renderCyclePromise = null;
+
+    var RENDER_CHUNK_SIZE = 50;
+
+    function renderRange(start, end) {
+        var generation = renderGeneration;
+        var targetEnd = Math.min(end, filteredPackages.length);
+
+        if (!isRendering && renderedCount >= targetEnd) {
+            updateCount();
+            updateEmptyState();
+            updateInfiniteSentinel();
+            return Promise.resolve(renderedCount);
+        }
+
+        if (isRendering) {
+            if (!pendingRenderRange || pendingRenderRange.generation !== generation) {
+                pendingRenderRange = { generation: generation, start: start, end: targetEnd };
+            } else {
+                pendingRenderRange.start = Math.min(pendingRenderRange.start, start);
+                pendingRenderRange.end = Math.max(pendingRenderRange.end, targetEnd);
+            }
+            return renderCyclePromise || Promise.resolve(renderedCount);
+        }
+        isRendering = true;
+        renderCyclePromise = new Promise(function (resolve) {
+            var actualEnd = targetEnd;
+            var cursor = start;
+
+            function finishRenderCycle() {
+                if (generation !== renderGeneration) {
+                    resolve(renderedCount);
+                    return;
+                }
+
+                updateCount();
+                updateEmptyState();
+                updateInfiniteSentinel();
+
+                var nextRange = pendingRenderRange && pendingRenderRange.generation === generation
+                    ? pendingRenderRange
+                    : null;
+                pendingRenderRange = null;
+
+                if (nextRange) {
+                    isRendering = false;
+                    renderCyclePromise = null;
+                    renderRange(Math.min(renderedCount, nextRange.start), nextRange.end).then(resolve);
+                    return;
+                }
+
+                isRendering = false;
+                renderCyclePromise = null;
+                resolve(renderedCount);
+            }
+
+            function renderChunk() {
+                if (generation !== renderGeneration) {
+                    resolve(renderedCount);
+                    return;
+                }
+
+                var chunkEnd = Math.min(cursor + RENDER_CHUNK_SIZE, actualEnd);
+                appendCardsForRange(cursor, chunkEnd);
+                cursor = chunkEnd;
+                renderedCount = Math.max(renderedCount, chunkEnd);
+
+                if (cursor < actualEnd) {
+                    setTimeout(renderChunk, 0);
+                } else {
+                    finishRenderCycle();
+                }
+            }
+
+            renderChunk();
+        });
+
+        return renderCyclePromise;
+    }
+
     function scrollToCard(name) {
-        var card = cardMap[name];
-        if (!card) return;
-        if (card.classList.contains('pkg-hidden')) {
+        var targetPkg = packageIndex[name];
+        if (!targetPkg) return;
+
+        if (!matchesActiveFilters(targetPkg)) {
             searchInput.value = '';
-            activeTypes.forEach(function (t) {
-                var pill = document.querySelector('.pkg-pill[data-type="' + t + '"]');
-                if (pill) pill.classList.remove('active');
-            });
-            activeTypes.clear();
+            clearActiveFilterPills();
             applyFilters();
         }
-        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        card.classList.add('pkg-highlight');
-        setTimeout(function () { card.classList.remove('pkg-highlight'); }, 1500);
+
+        queueManifestFetch(targetPkg);
+        ensureCardRendered(name).then(function (rendered) {
+            if (!rendered) return;
+            requestAnimationFrame(function () {
+                focusCard(name);
+            });
+        });
     }
 
     // --- Authors ---
-
-    function authorEmail(pkg) {
-        if (pkg.maintainers && pkg.maintainers.length && pkg.maintainers[0].username) return pkg.maintainers[0].email || '';
-        if (pkg.publisher && pkg.publisher.username) return pkg.publisher.email || '';
-        if (pkg.publisher && pkg.publisher.email) return pkg.publisher.email;
-        return '';
-    }
-
-    function loadAvatar(avatar, urls) {
+    function loadAvatar(avatar) {
+        if (avatar.dataset.avatarLoaded === 'true') return;
+        var urls = avatar._avatarUrls || [];
         if (!urls.length) return;
+        avatar.dataset.avatarLoaded = 'true';
+        var fallback = avatar.querySelector('.pkg-author-avatar-fallback');
         var img = document.createElement('img');
         img.alt = '';
-        img.addEventListener('load', function () {
-            avatar.textContent = '';
-            avatar.style.backgroundColor = 'transparent';
-            avatar.appendChild(img);
-        });
-        img.addEventListener('error', function () {
-            loadAvatar(avatar, urls.slice(1));
-        });
+        img.loading = 'lazy';
+        img.decoding = 'async';
+        avatar.appendChild(img);
+
+        var index = 0;
+        img.onerror = function () {
+            index++;
+            if (index >= urls.length) {
+                img.remove();
+                return;
+            }
+            img.src = urls[index];
+        };
+        img.onload = function () {
+            if (fallback && fallback.parentNode) fallback.remove();
+            avatar.classList.add('has-image');
+        };
         img.src = urls[0];
     }
 
-    function renderAuthors() {
+    function observeAvatar(avatar, urls) {
+        avatar._avatarUrls = urls;
+        if (avatarObserver) avatarObserver.observe(avatar);
+        else loadAvatar(avatar);
+    }
+
+    function prepareAuthors() {
+        if (avatarObserver) avatarObserver.disconnect();
         authorGrid.innerHTML = '';
-        if (!packages.length) { authorsSection.style.display = 'none'; return; }
+        authorsRendered = false;
+
+        if (!packages.length) {
+            authorsData = [];
+            authorsSection.style.display = 'none';
+            return;
+        }
 
         var groups = {};
         var emails = {};
         packages.forEach(function (pkg) {
             var name = authorName(pkg);
-            if (!groups[name]) groups[name] = 0;
-            groups[name]++;
+            groups[name] = (groups[name] || 0) + 1;
             if (!emails[name]) {
-                var e = authorEmail(pkg);
+                var e = authorEmail(pkg, name);
                 if (e) emails[name] = e.toLowerCase().trim();
             }
         });
 
-        var authors = Object.keys(groups).map(function (name) {
-            return { name: name, count: groups[name] };
+        authorsData = Object.keys(groups).map(function (name) {
+            var urls = [];
+            if (emails[name]) urls.push('https://www.gravatar.com/avatar/' + md5(emails[name]) + '?s=72&d=404');
+            urls.push('https://github.com/' + encodeURIComponent(name) + '.png?size=72');
+            return { name: name, count: groups[name], avatarUrls: urls };
         }).sort(function (a, b) { return b.count - a.count; });
 
-        authors.forEach(function (a) {
+        authorsSection.style.display = authorsData.length ? '' : 'none';
+        if (!authorsData.length) return;
+
+        if (authorsObserver) authorsObserver.observe(authorsSection);
+        else renderAuthors();
+    }
+
+    function renderAuthors() {
+        if (authorsRendered) return;
+        authorsRendered = true;
+
+        var fragment = document.createDocumentFragment();
+        authorsData.forEach(function (a) {
             var card = document.createElement('div');
             card.className = 'pkg-author-card';
 
             var avatar = document.createElement('div');
             avatar.className = 'pkg-author-avatar';
             avatar.style.backgroundColor = hashColor(a.name);
-            avatar.textContent = a.name.charAt(0).toUpperCase();
-            var urls = [];
-            if (emails[a.name]) urls.push('https://www.gravatar.com/avatar/' + md5(emails[a.name]) + '?s=72&d=404');
-            urls.push('https://github.com/' + encodeURIComponent(a.name) + '.png?size=72');
-            loadAvatar(avatar, urls);
+            var fallback = document.createElement('span');
+            fallback.className = 'pkg-author-avatar-fallback';
+            fallback.textContent = a.name.charAt(0).toUpperCase();
+            avatar.appendChild(fallback);
             card.appendChild(avatar);
 
             var info = document.createElement('div');
@@ -929,26 +1396,51 @@
             info.appendChild(countEl);
             card.appendChild(info);
 
-            card.addEventListener('click', function () {
+            bindActionCard(card, function () {
                 searchInput.value = a.name;
                 applyFilters();
                 document.querySelector('.pkg-filters').scrollIntoView({ behavior: 'smooth', block: 'start' });
             });
-            authorGrid.appendChild(card);
+
+            observeAvatar(avatar, a.avatarUrls);
+            fragment.appendChild(card);
         });
-        authorsSection.style.display = '';
+        authorGrid.appendChild(fragment);
     }
 
     // --- Filter / Sort ---
+    function currentSearchQuery() {
+        return searchInput.value.toLowerCase().trim();
+    }
 
-    function applyFilters() {
-        var query = searchInput.value.toLowerCase().trim();
+    function matchesSearch(pkg, query) {
+        if (!query) return true;
+        var inName = pkg.name.toLowerCase().indexOf(query) !== -1;
+        var inDesc = (pkg.description || '').toLowerCase().indexOf(query) !== -1;
+        var inAuthor = authorName(pkg).toLowerCase().indexOf(query) !== -1;
+        return inName || inDesc || inAuthor;
+    }
+
+    function matchesActiveFilters(pkg) {
+        var query = currentSearchQuery();
         var demoOnly = activeTypes.has('demo');
         var typeFilters = new Set(activeTypes);
         typeFilters.delete('demo');
 
-        var sorted = packages.slice();
+        if (!matchesSearch(pkg, query)) return false;
+        if (typeFilters.size > 0) {
+            var hasMatch = (pkg.types || []).some(function (t) { return typeFilters.has(t); });
+            if (!hasMatch) return false;
+        }
+        if (demoOnly && !pkg.video && !pkg.image) return false;
+        return true;
+    }
+
+    function getSortedPackages() {
         var sortVal = sortSelect.value;
+        if (sortedPackagesCache[sortVal]) return sortedPackagesCache[sortVal];
+
+        var sorted = packages.slice();
         if (sortVal === 'downloads') {
             sorted.sort(function (a, b) { return (b.downloads || 0) - (a.downloads || 0); });
         } else if (sortVal === 'recent') {
@@ -956,50 +1448,127 @@
         } else {
             sorted.sort(function (a, b) { return a.name.localeCompare(b.name); });
         }
+        
+        sortedPackagesCache[sortVal] = sorted;
+        return sorted;
+    }
 
-        var visible = 0;
-        sorted.forEach(function (pkg) {
-            var card = cardMap[pkg.name];
-            if (!card) return;
+    function updateCount() {
+        countEl.textContent = renderedCount + ' of ' + filteredPackages.length;
+    }
 
-            var show = true;
-            if (query) {
-                var inName = pkg.name.toLowerCase().indexOf(query) !== -1;
-                var inDesc = (pkg.description || '').toLowerCase().indexOf(query) !== -1;
-                var inAuthor = authorName(pkg).toLowerCase().indexOf(query) !== -1;
-                if (!inName && !inDesc && !inAuthor) show = false;
-            }
-            if (show && typeFilters.size > 0) {
-                var hasMatch = (pkg.types || []).some(function (t) { return typeFilters.has(t); });
-                if (!hasMatch) show = false;
-            }
-            if (show && demoOnly && !pkg.video && !pkg.image) show = false;
-
-            if (show) {
-                card.classList.remove('pkg-hidden');
-                visible++;
-            } else {
-                card.classList.add('pkg-hidden');
-            }
-            grid.appendChild(card);
-        });
-
+    function updateEmptyState() {
         var emptyEl = grid.querySelector('.pkg-empty');
-        if (visible === 0 && packages.length > 0) {
+        if (filteredPackages.length === 0 && packages.length > 0) {
             if (!emptyEl) {
                 emptyEl = document.createElement('div');
                 emptyEl.className = 'pkg-empty';
-                emptyEl.textContent = 'No packages match your filters.';
+                grid.appendChild(emptyEl);
             }
-            grid.appendChild(emptyEl);
-        } else if (emptyEl) {
-            emptyEl.remove();
+            emptyEl.textContent = 'No packages match your filters.';
+            return;
         }
-
-        countEl.textContent = visible + ' of ' + packages.length;
+        if (emptyEl) emptyEl.remove();
     }
 
-    var debounceTimer;
+    function updateInfiniteSentinel() {
+        if (!infiniteSentinel) return;
+        if (renderedCount < filteredPackages.length) {
+            infiniteSentinel.style.display = '';
+            infiniteSentinel.classList.add('loading');
+            if (infiniteObserver) infiniteObserver.observe(infiniteSentinel);
+        } else {
+            infiniteSentinel.style.display = 'none';
+            infiniteSentinel.classList.remove('loading');
+            if (infiniteObserver) infiniteObserver.unobserve(infiniteSentinel);
+        }
+    }
+
+    function appendCardsForRange(start, end) {
+        var fragment = document.createDocumentFragment();
+        var actualEnd = Math.min(end, filteredPackages.length);
+        for (var i = start; i < actualEnd; i++) {
+            var pkg = filteredPackages[i];
+            if (cardMap[pkg.name]) continue;
+            queueManifestFetch(pkg);
+            var card = createCard(pkg);
+            cardMap[pkg.name] = card;
+            fragment.appendChild(card);
+            observeCardMedia(card);
+        }
+        grid.appendChild(fragment);
+        return actualEnd;
+    }
+
+    function renderNextBatch() {
+        if (renderedCount >= filteredPackages.length) return Promise.resolve(renderedCount);
+        return renderRange(renderedCount, renderedCount + currentBatchSize());
+    }
+
+    function handleInfiniteScroll() {
+        if (renderedCount < filteredPackages.length) {
+            renderNextBatch();
+        }
+    }
+
+    function activeFiltersDependOnManifestData() {
+        return activeTypes.size > 0;
+    }
+
+    function queueManifestFetchesForActiveFilters() {
+        if (!activeFiltersDependOnManifestData()) return;
+
+        var query = currentSearchQuery();
+        getSortedPackages().forEach(function (pkg) {
+            if (matchesSearch(pkg, query)) queueManifestFetch(pkg);
+        });
+    }
+
+    function scheduleFilteredResultsRefresh() {
+        clearTimeout(filteredRefreshTimer);
+        filteredRefreshTimer = setTimeout(function () {
+            filteredRefreshTimer = null;
+            refreshFilteredResults();
+        }, MANIFEST_FILTER_REFRESH_DELAY);
+    }
+
+    function refreshFilteredResults() {
+        var scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+        var oldRenderedCount = renderedCount;
+        var newFiltered = getSortedPackages().filter(matchesActiveFilters);
+
+        // Check if the filtered set order changed to decide between full rebuild vs incremental
+        var orderChanged = newFiltered.length !== filteredPackages.length;
+        if (!orderChanged) {
+            for (var i = 0; i < newFiltered.length; i++) {
+                if (newFiltered[i].name !== filteredPackages[i].name) {
+                    orderChanged = true;
+                    break;
+                }
+            }
+        }
+
+        filteredPackages = newFiltered;
+
+        if (orderChanged) {
+            clearRenderedCards();
+            var targetCount = Math.max(oldRenderedCount, currentBatchSize());
+            renderRange(0, targetCount);
+        }
+
+        updateEmptyState();
+        updateCount();
+        updateInfiniteSentinel();
+        if (orderChanged) window.scrollTo(0, scrollTop);
+    }
+
+    function applyFilters() {
+        // Don't abort manifest fetches on filter changes - let them complete
+        // and cache for when filters are cleared. Only abort on init/retry.
+        queueManifestFetchesForActiveFilters();
+        refreshFilteredResults();
+    }
+
     searchInput.addEventListener('input', function () {
         clearTimeout(debounceTimer);
         debounceTimer = setTimeout(applyFilters, 200);
@@ -1023,11 +1592,11 @@
 
     retryBtn.addEventListener('click', function () {
         errorEl.style.display = 'none';
+        clearTimeout(debounceTimer);
         init();
     });
 
-    // --- Skeleton loading ---
-
+    // --- Skeleton Loading ---
     function showSkeletons() {
         grid.innerHTML = '';
         for (var i = 0; i < 6; i++) {
@@ -1041,8 +1610,7 @@
         grid.querySelectorAll('.pkg-skeleton').forEach(function (s) { s.remove(); });
     }
 
-    // --- Data processing ---
-
+    // --- Data Processing ---
     function processSearchResults(objects) {
         return objects.map(function (obj) {
             var p = obj.package;
@@ -1063,107 +1631,183 @@
         });
     }
 
-    // --- Rendering ---
-
-    function renderCards() {
-        grid.innerHTML = '';
-        cardMap = {};
-        packages.forEach(function (pkg) {
-            var flagStatus = getFlagStatus(pkg.name);
-            var card = createCard(pkg, flagStatus);
-            cardMap[pkg.name] = card;
-            grid.appendChild(card);
-            if (pkg.video || pkg.image) injectMedia(card, pkg);
-        });
-        applyFilters();
-        renderRecent();
-        renderAuthors();
+    // --- Manifest Fetching ---
+    function applyManifestData(pkg, data) {
+        if (!data) return;
+        if (data.types && data.types.length) pkg.types = data.types;
+        pkg.video = data.video || null;
+        pkg.image = data.image || null;
     }
 
-    // --- Phase 2: manifest fetches ---
+    function hasValidManifestCache(pkg) {
+        var cached = manifestCache[pkg.name];
+        if (!cached) return false;
+        return !cached.version || cached.version === pkg.version;
+    }
 
-    function fetchManifests(myCounter) {
-        var names = packages.map(function (p) { return p.name; });
-        var manifests = {};
-        var idx = 0;
-        var hasDemo = false;
-
-        function nextBatch() {
-            if (fetchCounter !== myCounter) return;
-            if (idx >= names.length) {
-                saveCache(manifests);
-                if (hasDemo) demoPill.style.display = '';
-                return;
+    function updateCardFromManifest(pkg) {
+        var card = cardMap[pkg.name];
+        if (card) {
+            ensureMediaWrapState(card, pkg);
+            var badges = card.querySelector('.pkg-badges');
+            if (badges) {
+                renderBadges(badges, pkg.types);
+                appendFlagBadge(badges, pkg.name);
             }
-            var batch = names.slice(idx, idx + BATCH_SIZE);
-            idx += BATCH_SIZE;
+            revealCardMedia(card);
+        }
+        var recentCard = document.querySelector('.pkg-recent-card[data-name="' + pkg.name + '"]');
+        if (recentCard) {
+            var footer = recentCard.querySelector('.pkg-recent-footer');
+            if (footer && pkg.types && pkg.types.length) {
+                var badge = footer.querySelector('.pkg-badge');
+                if (!badge) {
+                    badge = document.createElement('span');
+                    badge.className = 'pkg-badge';
+                    footer.appendChild(badge);
+                }
+                badge.dataset.type = pkg.types[0];
+                badge.textContent = pkg.types[0];
+            }
+        }
+    }
 
-            Promise.all(batch.map(function (name) {
-                return fetch(MANIFEST_API + encodeURIComponent(name) + '/latest')
-                    .then(function (r) { return r.ok ? r.json() : null; })
-                    .catch(function () { return null; });
-            })).then(function (results) {
-                if (fetchCounter !== myCounter) return;
-                results.forEach(function (manifest, i) {
-                    var name = batch[i];
-                    var pkg = packages.find(function (p) { return p.name === name; });
-                    if (!pkg) return;
-                    if (!manifest) {
-                        manifests[name] = { video: null, image: null, types: pkg.types };
-                        return;
-                    }
+    function updateManifestCacheEntry(pkg, data) {
+        manifestCache[pkg.name] = {
+            version: pkg.version,
+            video: data.video,
+            image: data.image,
+            types: data.types
+        };
+    }
 
+    function fetchManifestEntry(name, signal) {
+        var pkg = packageIndex[name];
+        if (!pkg) return Promise.resolve({ ok: false });
+
+        return fetch(MANIFEST_API + encodeURIComponent(name) + '/' + encodeURIComponent(pkg.version), { signal: signal })
+            .then(function (r) {
+                if (!r.ok) return { ok: false, status: r.status };
+                return r.json().then(function (manifest) {
+                    var fallbackTypes = pkg ? pkg.types : [];
                     var pi = manifest.pi || null;
-                    var mTypes = typesFromManifest(pi);
-                    if (mTypes.length) pkg.types = mTypes;
-                    var video = videoFromManifest(pi);
-                    var image = imageFromManifest(pi);
-                    if (video) {
-                        pkg.video = video;
-                        hasDemo = true;
-                    }
-                    if (image) {
-                        pkg.image = image;
-                        hasDemo = true;
-                    }
-                    manifests[name] = { video: pkg.video, image: pkg.image, types: pkg.types };
-
-                    var card = cardMap[name];
-                    if (card) {
-                        var badges = card.querySelector('.pkg-badges');
-                        if (badges) {
-                            renderBadges(badges, pkg.types);
-                            if (getFlagStatus(name) === 'warn') {
-                                var fb = document.createElement('span');
-                                fb.className = 'pkg-badge';
-                                fb.dataset.type = 'flagged';
-                                fb.innerHTML = SVG_SHIELD + ' flagged';
-                                fb.title = 'This package has been flagged for review. We recommend waiting before installing.';
-                                badges.appendChild(fb);
-                            }
+                    var manifestTypes = typesFromManifest(pi);
+                    return {
+                        ok: true,
+                        data: {
+                            video: videoFromManifest(pi),
+                            image: imageFromManifest(pi),
+                            types: manifestTypes.length ? manifestTypes : fallbackTypes
                         }
-                        if (video || image) injectMedia(card, pkg);
-                    }
+                    };
                 });
-                nextBatch();
+            }).catch(function (e) {
+                if (e.name === 'AbortError') return { aborted: true };
+                return { ok: false };
             });
+    }
+
+    var saveCacheTimer = null;
+    function debouncedSaveCache() {
+        if (saveCacheTimer) return;
+        saveCacheTimer = setTimeout(function () {
+            saveCacheTimer = null;
+            saveCache();
+        }, 500);
+    }
+
+    var pumpScheduled = false;
+    function schedulePumpContinuation() {
+        if (pumpScheduled) return;
+        pumpScheduled = true;
+        Promise.resolve().then(function () {
+            pumpScheduled = false;
+            continueManifestPump();
+        });
+    }
+
+    function continueManifestPump() {
+        if (!manifestQueue.length || manifestActiveCount >= MAX_MANIFEST_CONCURRENCY) {
+            if (manifestActiveCount === 0 && !manifestQueue.length) scheduleManifestRetryTimer();
+            return;
         }
 
-        nextBatch();
+        if (!manifestController) manifestController = new AbortController();
+        var signal = manifestController.signal;
+
+        while (manifestQueue.length > 0 && manifestActiveCount < MAX_MANIFEST_CONCURRENCY) {
+            var name = manifestQueue.shift();
+            manifestActiveCount++;
+            
+            (function(pkgName) {
+                fetchManifestEntry(pkgName, signal).then(function (result) {
+                    if (signal.aborted || result.aborted) {
+                        delete manifestPending[pkgName];
+                        return;
+                    }
+                    manifestActiveCount = Math.max(0, manifestActiveCount - 1);
+                    delete manifestPending[pkgName];
+
+                    if (!result || !result.ok) {
+                        var retries = (manifestRetryCount[pkgName] || 0) + 1;
+                        if (result.status === 404 || retries > MAX_MANIFEST_RETRIES) {
+                            manifestFailed[pkgName] = true;
+                            delete manifestRetryCount[pkgName];
+                            delete manifestRetryAfter[pkgName];
+                        } else {
+                            manifestRetryCount[pkgName] = retries;
+                            var delay = MANIFEST_RETRY_DELAY * Math.pow(2, retries - 1);
+                            manifestRetryAfter[pkgName] = Date.now() + delay;
+                            scheduleManifestRetryTimer();
+                        }
+                    } else {
+                        var pkg = packageIndex[pkgName];
+                        if (pkg) {
+                            var shouldCheckFilter = activeFiltersDependOnManifestData();
+                            var matchedBefore = shouldCheckFilter ? matchesActiveFilters(pkg) : false;
+                            updateManifestCacheEntry(pkg, result.data);
+                            applyManifestData(pkg, result.data);
+                            updateCardFromManifest(pkg);
+                            if (shouldCheckFilter && matchedBefore !== matchesActiveFilters(pkg)) {
+                                scheduleFilteredResultsRefresh();
+                            }
+                            updateDemoPillVisibility();
+                        }
+                    }
+                }).finally(function () {
+                    if (signal.aborted) return;
+                    debouncedSaveCache();
+                    schedulePumpContinuation();
+                });
+            })(name);
+        }
     }
 
-    // --- Search API fetch with pagination ---
+    function queueManifestFetch(pkg) {
+        if (!pkg) return;
+        if (hasValidManifestCache(pkg)) return;
+        if (manifestFailed[pkg.name]) return;
+        if (manifestPending[pkg.name]) return;
+        if (manifestRetryAfter[pkg.name] && manifestRetryAfter[pkg.name] > Date.now()) return;
 
-    function fetchSearch() {
+        delete manifestRetryAfter[pkg.name];
+        manifestPending[pkg.name] = true;
+        manifestQueue.push(pkg.name);
+        continueManifestPump();
+    }
+
+    // --- Search API ---
+    function fetchSearch(myCounter) {
         var allObjects = [];
-
         function fetchPage(from) {
+            if (myCounter !== undefined && fetchCounter !== myCounter) return Promise.resolve({ objects: [], total: 0 });
             var url = SEARCH_API + '?text=keywords:pi-package&size=250';
             if (from > 0) url += '&from=' + from;
             return fetch(url).then(function (r) {
                 if (!r.ok) throw new Error('HTTP ' + r.status);
                 return r.json();
             }).then(function (data) {
+                if (myCounter !== undefined && fetchCounter !== myCounter) return allObjects;
                 allObjects = allObjects.concat(data.objects || []);
                 if (allObjects.length < data.total && data.objects && data.objects.length > 0) {
                     return fetchPage(allObjects.length);
@@ -1171,53 +1815,106 @@
                 return allObjects;
             });
         }
-
         return fetchPage(0);
     }
 
-    // --- Package cache ---
-
+    // --- Cache ---
     function loadCache() {
         try {
             var raw = localStorage.getItem(CACHE_KEY);
             if (!raw) return null;
-            return JSON.parse(raw);
+            var parsed = JSON.parse(raw);
+            if (parsed.version !== CACHE_VERSION) return null;
+            parsed.searchTimestamp = parsed.searchTimestamp || parsed.timestamp || 0;
+            return parsed;
         } catch (e) {
             return null;
         }
     }
 
-    function saveCache(manifests) {
+    function saveCache() {
         try {
             localStorage.setItem(CACHE_KEY, JSON.stringify({
-                timestamp: Date.now(),
-                search: packages,
-                manifests: manifests
+                version: CACHE_VERSION,
+                searchTimestamp: searchCacheTimestamp,
+                search: searchPackages,
+                manifests: manifestCache
             }));
         } catch (e) {}
     }
 
-    function applyCachedManifests(manifests) {
-        if (!manifests) return;
-        var hasDemo = false;
-        packages.forEach(function (pkg) {
-            var m = manifests[pkg.name];
-            if (!m) return;
-            if (m.types && m.types.length) pkg.types = m.types;
-            if (m.video) {
-                pkg.video = m.video;
-                hasDemo = true;
-            }
-            if (m.image) {
-                pkg.image = m.image;
-                hasDemo = true;
-            }
+    function applyCachedManifests() {
+        Object.keys(manifestCache).forEach(function (name) {
+            var pkg = packageIndex[name];
+            if (!pkg) return;
+            var m = manifestCache[name];
+            if (m.version && m.version !== pkg.version) return;
+            applyManifestData(pkg, m);
         });
-        if (hasDemo) demoPill.style.display = '';
+        updateDemoPillVisibility();
     }
 
-    // --- Flag cache ---
+    function pruneManifestState(currentPackages) {
+        var activeVersions = {};
+        currentPackages.forEach(function (pkg) {
+            activeVersions[pkg.name] = pkg.version;
+        });
 
+        Object.keys(manifestCache).forEach(function (name) {
+            if (!activeVersions[name]) {
+                delete manifestCache[name];
+                return;
+            }
+            if (manifestCache[name].version && manifestCache[name].version !== activeVersions[name]) {
+                delete manifestCache[name];
+            }
+        });
+
+        manifestQueue = manifestQueue.filter(function (name) {
+            return !!activeVersions[name];
+        });
+
+        Object.keys(manifestPending).forEach(function (name) {
+            if (!activeVersions[name]) delete manifestPending[name];
+        });
+
+        Object.keys(manifestRetryAfter).forEach(function (name) {
+            if (!activeVersions[name]) delete manifestRetryAfter[name];
+        });
+
+        Object.keys(manifestRetryCount).forEach(function (name) {
+            if (!activeVersions[name]) delete manifestRetryCount[name];
+        });
+
+        Object.keys(manifestFailed).forEach(function (name) {
+            if (!activeVersions[name]) delete manifestFailed[name];
+        });
+
+        scheduleManifestRetryTimer();
+    }
+
+    function rebuildPackagesFromSearch() {
+        packages = searchPackages
+            .filter(function (pkg) { return getFlagStatus(pkg.name) !== 'hide'; })
+            .map(cloneSearchPackage);
+        pruneManifestState(packages);
+        indexPackages();
+        applyCachedManifests();
+    }
+
+    function updateDemoPillVisibility() {
+        if (!demoPill) return;
+        var hasDemo = false;
+        for (var i = 0; i < packages.length; i++) {
+            if (packages[i].video || packages[i].image) {
+                hasDemo = true;
+                break;
+            }
+        }
+        demoPill.style.display = hasDemo ? '' : 'none';
+    }
+
+    // --- Flag Cache ---
     function loadFlagCache() {
         try {
             var raw = localStorage.getItem(FLAG_CACHE_KEY);
@@ -1228,11 +1925,27 @@
         }
     }
 
-    function fetchFlags() {
-        return fetch(FLAG_API).then(function (r) {
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            return r.json();
-        }).then(function (issues) {
+    function fetchFlags(myCounter) {
+        var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        var timeoutId = controller ? setTimeout(function() { controller.abort(); }, 15000) : null;
+
+        function fetchFlagPage(page, issues) {
+            if (myCounter !== undefined && fetchCounter !== myCounter) return Promise.resolve(issues);
+            var url = FLAG_API + '?labels=package-flag&state=all&per_page=' + FLAG_PAGE_SIZE + '&page=' + page;
+            var opts = controller ? { signal: controller.signal } : {};
+            return fetch(url, opts).then(function (r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.json();
+            }).then(function (pageIssues) {
+                if (myCounter !== undefined && fetchCounter !== myCounter) return issues;
+                var nextIssues = issues.concat(pageIssues);
+                if (pageIssues.length === FLAG_PAGE_SIZE) return fetchFlagPage(page + 1, nextIssues);
+                return nextIssues;
+            });
+        }
+
+        return fetchFlagPage(1, []).then(function (issues) {
+            if (timeoutId) clearTimeout(timeoutId);
             var flags = {};
             issues.forEach(function (issue) {
                 var m = issue.title.match(/^Package Report:\s*(.+)/i);
@@ -1248,28 +1961,44 @@
                 localStorage.setItem(FLAG_CACHE_KEY, JSON.stringify({ ts: Date.now(), flags: flags }));
             } catch (e) {}
             return flags;
-        }).catch(function () {
+        }).catch(function (e) {
+            if (timeoutId) clearTimeout(timeoutId);
             var cached = loadFlagCache();
             return (cached && cached.flags) || {};
         });
     }
 
     // --- Init ---
+    function renderAll() {
+        filteredPackages = getSortedPackages().filter(matchesActiveFilters);
+        clearRenderedCards();
+        renderNextBatch();
+        renderRecent();
+        queueManifestFetchesForActiveFilters();
+        prepareAuthors();
+        updateCount();
+        updateEmptyState();
+        updateInfiniteSentinel();
+    }
 
     function init() {
         var cache = loadCache();
         var flagCache = loadFlagCache();
         var myCounter = ++fetchCounter;
 
-        if (flagCache && flagCache.flags) flaggedPkgs = flagCache.flags;
+        clearTimeout(filteredRefreshTimer);
+        filteredRefreshTimer = null;
+        searchCacheTimestamp = cache ? cache.searchTimestamp || 0 : 0;
+        abortManifestFetches();
+        manifestCache = (cache && cache.manifests) || {};
+        searchPackages = (cache && cache.search) || [];
+        flaggedPkgs = (flagCache && flagCache.flags) || {};
 
-        if (cache && cache.search && cache.search.length) {
-            packages = cache.search;
-            packages = packages.filter(function (p) { return getFlagStatus(p.name) !== 'hide'; });
-            applyCachedManifests(cache.manifests);
-            renderCards();
+        if (searchPackages.length) {
+            rebuildPackagesFromSearch();
+            renderAll();
 
-            var age = Date.now() - (cache.timestamp || 0);
+            var age = Date.now() - (searchCacheTimestamp || 0);
             var flagAge = flagCache ? Date.now() - (flagCache.ts || 0) : Infinity;
             if (age > CACHE_TTL || flagAge > FLAG_CACHE_TTL) {
                 refreshInBackground(myCounter);
@@ -1279,14 +2008,15 @@
 
         showSkeletons();
 
-        Promise.all([fetchSearch(), fetchFlags()]).then(function (results) {
+        Promise.all([fetchSearch(myCounter), fetchFlags(myCounter)]).then(function (results) {
             if (fetchCounter !== myCounter) return;
-            packages = processSearchResults(results[0]);
+            searchPackages = processSearchResults(results[0]);
             flaggedPkgs = results[1];
-            packages = packages.filter(function (p) { return getFlagStatus(p.name) !== 'hide'; });
+            rebuildPackagesFromSearch();
             clearSkeletons();
-            renderCards();
-            fetchManifests(myCounter);
+            renderAll();
+            searchCacheTimestamp = Date.now();
+            saveCache();
         }).catch(function () {
             if (fetchCounter !== myCounter) return;
             clearSkeletons();
@@ -1295,14 +2025,83 @@
     }
 
     function refreshInBackground(myCounter) {
-        Promise.all([fetchSearch(), fetchFlags()]).then(function (results) {
+        Promise.allSettled([fetchSearch(myCounter), fetchFlags(myCounter)]).then(function (results) {
             if (fetchCounter !== myCounter) return;
-            packages = processSearchResults(results[0]);
-            flaggedPkgs = results[1];
-            packages = packages.filter(function (p) { return getFlagStatus(p.name) !== 'hide'; });
-            renderCards();
-            fetchManifests(myCounter);
-        }).catch(function () {});
+            if (results[0].status !== 'fulfilled' && results[1].status !== 'fulfilled') return;
+
+            if (results[0].status === 'fulfilled') {
+                searchPackages = processSearchResults(results[0].value);
+                searchCacheTimestamp = Date.now();
+            }
+            if (results[1].status === 'fulfilled') {
+                flaggedPkgs = results[1].value;
+            }
+
+            abortManifestFetches();
+            rebuildPackagesFromSearch();
+            renderAll();
+            saveCache();
+        }).catch(function (e) {
+            if (typeof console !== 'undefined' && console.warn) {
+                console.warn('Background refresh failed:', e);
+            }
+        });
+    }
+
+    // --- Event Listeners ---
+    hoverMedia.addEventListener('change', function (event) {
+        hasDesktop = event.matches;
+        var cards = Object.keys(cardMap).filter(function (name) {
+            var pkg = packageIndex[name];
+            return pkg && (pkg.video || pkg.image);
+        });
+        // Process in batches to avoid timeout accumulation
+        var batchSize = 50;
+        var delay = 0;
+        for (var i = 0; i < cards.length; i += batchSize) {
+            (function (batch) {
+                setTimeout(function () {
+                    batch.forEach(function (name) {
+                        var card = cardMap[name];
+                        if (card) {
+                            cleanupCardMedia(card);
+                            revealCardMedia(card);
+                        }
+                    });
+                }, delay);
+            })(cards.slice(i, i + batchSize));
+            delay += 50; // 50ms between batches
+        }
+    });
+
+    window.addEventListener('beforeunload', function () {
+        clearTimeout(debounceTimer);
+        clearTimeout(filteredRefreshTimer);
+        if (saveCacheTimer) { clearTimeout(saveCacheTimer); saveCacheTimer = null; }
+        abortManifestFetches();
+        saveCache();
+        if (mediaObserver) mediaObserver.disconnect();
+        if (authorsObserver) authorsObserver.disconnect();
+        if (avatarObserver) avatarObserver.disconnect();
+        if (infiniteObserver) infiniteObserver.disconnect();
+    });
+
+    // --- Scroll fallback for environments without IntersectionObserver ---
+    if (!infiniteObserver) {
+        var scrollFallbackTimer = null;
+        window.addEventListener('scroll', function () {
+            if (scrollFallbackTimer) return;
+            scrollFallbackTimer = setTimeout(function () {
+                scrollFallbackTimer = null;
+                if (!isRendering && renderedCount < filteredPackages.length) {
+                    var docHeight = document.documentElement.scrollHeight;
+                    var scrollBottom = window.pageYOffset + window.innerHeight;
+                    if (scrollBottom >= docHeight - 400) {
+                        handleInfiniteScroll();
+                    }
+                }
+            }, 150);
+        });
     }
 
     init();
